@@ -31,7 +31,7 @@
     reason = "Alloy sol! macro generates code that triggers these lints"
 )]
 
-use alloy::primitives::ChainId;
+use alloy::primitives::{Address, B256, ChainId, U256};
 use alloy::providers::Provider;
 use alloy::sol;
 
@@ -122,6 +122,18 @@ sol! {
             uint256[] calldata amounts
         ) external;
     }
+
+    #[sol(rpc)]
+    interface IV2NegRiskWrapper {
+        /// Converts positions on a V2 neg-risk wrapper. Transforms a position
+        /// covering one outcome bitmask into the equivalent position covering
+        /// the complementary set within a neg-risk market.
+        function convertPositions(
+            bytes32 marketId,
+            uint256 indexSet,
+            uint256 amount
+        ) external;
+    }
 }
 
 /// Client for interacting with the Conditional Token Framework contract.
@@ -132,6 +144,7 @@ sol! {
 pub struct Client<P: Provider> {
     contract: IConditionalTokens::IConditionalTokensInstance<P>,
     neg_risk_adapter: Option<INegRiskAdapter::INegRiskAdapterInstance<P>>,
+    v2_neg_risk_wrapper: Option<IV2NegRiskWrapper::IV2NegRiskWrapperInstance<P>>,
     provider: P,
 }
 
@@ -158,6 +171,7 @@ impl<P: Provider + Clone> Client<P> {
         Ok(Self {
             contract,
             neg_risk_adapter: None,
+            v2_neg_risk_wrapper: None,
             provider,
         })
     }
@@ -191,8 +205,114 @@ impl<P: Provider + Clone> Client<P> {
         Ok(Self {
             contract,
             neg_risk_adapter,
+            v2_neg_risk_wrapper: None,
             provider,
         })
+    }
+
+    /// Creates a CTF client targeting a V2 collateral wrapper.
+    ///
+    /// V2 wrappers (e.g. the pUSD-denominated `CtfCollateralAdapter` at
+    /// `0xADa100874d00e3331D00F2007a9c336a65009718` on Polygon) expose the
+    /// `IConditionalTokens` interface (`splitPosition`, `mergePositions`,
+    /// `redeemPositions`) at their own address, transparently bridging to
+    /// the underlying CTF and converting collateral as needed. Use this
+    /// when you want split/merge/redeem to operate against the wrapper's
+    /// collateral (typically pUSD) rather than against the legacy V1 CTF
+    /// (USDC.e).
+    ///
+    /// For the V2 *neg-risk* wrapper (which additionally exposes
+    /// `convertPositions`), use [`Self::with_v2_neg_risk_wrapper`] so
+    /// [`Self::convert_positions`] is enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - An alloy provider instance
+    /// * `wrapper_address` - The deployed wrapper contract address
+    #[must_use]
+    pub fn with_v2_wrapper(provider: P, wrapper_address: Address) -> Self {
+        let contract = IConditionalTokens::new(wrapper_address, provider.clone());
+        Self {
+            contract,
+            neg_risk_adapter: None,
+            v2_neg_risk_wrapper: None,
+            provider,
+        }
+    }
+
+    /// Creates a CTF client targeting the V2 *neg-risk* collateral wrapper.
+    ///
+    /// Identical to [`Self::with_v2_wrapper`] for the
+    /// `splitPosition`/`mergePositions`/`redeemPositions` paths, but also
+    /// enables [`Self::convert_positions`] for the neg-risk-specific
+    /// `convertPositions(marketId, indexSet, amount)` call.
+    ///
+    /// On Polygon, the V2 neg-risk wrapper is deployed at
+    /// `0xAdA200001000ef00D07553cEE7006808F895c6F1`.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - An alloy provider instance
+    /// * `wrapper_address` - The deployed neg-risk wrapper contract address
+    #[must_use]
+    pub fn with_v2_neg_risk_wrapper(provider: P, wrapper_address: Address) -> Self {
+        let contract = IConditionalTokens::new(wrapper_address, provider.clone());
+        let v2_neg_risk_wrapper =
+            Some(IV2NegRiskWrapper::new(wrapper_address, provider.clone()));
+        Self {
+            contract,
+            neg_risk_adapter: None,
+            v2_neg_risk_wrapper,
+            provider,
+        }
+    }
+
+    /// Converts positions on a V2 neg-risk wrapper.
+    ///
+    /// Calls `convertPositions(marketId, indexSet, amount)` on the wrapper
+    /// configured by [`Self::with_v2_neg_risk_wrapper`]. In a negative-risk
+    /// market, this transforms a position covering one set of outcome
+    /// indices into the equivalent position covering the complementary
+    /// set — useful for restructuring a holding without going through
+    /// the full split/merge cycle.
+    ///
+    /// Returns the transaction hash on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client was NOT constructed via
+    /// [`Self::with_v2_neg_risk_wrapper`] (no neg-risk wrapper bound), the
+    /// transport fails, or the on-chain transaction reverts.
+    pub async fn convert_positions(
+        &self,
+        market_id: B256,
+        index_set: U256,
+        amount: U256,
+    ) -> Result<B256> {
+        let wrapper = self.v2_neg_risk_wrapper.as_ref().ok_or_else(|| {
+            CtfError::ContractCall(
+                "convert_positions requires a V2 neg-risk wrapper client; \
+                 construct with Client::with_v2_neg_risk_wrapper(provider, address)"
+                    .into(),
+            )
+        })?;
+        let pending = wrapper
+            .convertPositions(market_id, index_set, amount)
+            .send()
+            .await
+            .map_err(|e| CtfError::ContractCall(format!("convertPositions send: {e}")))?;
+        let receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| CtfError::ContractCall(format!("convertPositions receipt: {e}")))?;
+        if !receipt.status() {
+            return Err(CtfError::ContractCall(format!(
+                "convertPositions tx reverted: {:#x}",
+                receipt.transaction_hash
+            ))
+            .into());
+        }
+        Ok(receipt.transaction_hash)
     }
 
     /// Calculates a condition ID.
