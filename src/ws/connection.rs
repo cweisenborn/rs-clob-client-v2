@@ -172,7 +172,7 @@ where
             _ = state_tx.send(ConnectionState::Connecting);
 
             // Attempt connection
-            match connect_async(&endpoint).await {
+            match Self::connect(&endpoint, &config).await {
                 Ok((ws_stream, _)) => {
                     attempt = 0;
                     backoff.reset();
@@ -292,10 +292,23 @@ where
                     }
                 }
 
-                // Handle outgoing messages from subscriptions
-                Some(text) = sender_rx.recv() => {
-                    if write.send(Message::Text(text.into())).await.is_err() {
-                        break;
+                // Handle outgoing messages from subscriptions.
+                //
+                // We match on the full `Option` (rather than the common
+                // `Some(text) = sender_rx.recv()` sugar) so that `None` —
+                // which means every `sender_tx` clone has been dropped —
+                // actively breaks the loop. With the pattern-sugar form,
+                // tokio::select! would just disable this arm and keep
+                // polling `read.next()`, leaving the connection (and its
+                // TCP socket) alive on a silent WS.
+                result = sender_rx.recv() => {
+                    match result {
+                        Some(text) => {
+                            if write.send(Message::Text(text.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
                     }
                 }
 
@@ -422,5 +435,59 @@ where
     #[must_use]
     pub fn state_receiver(&self) -> watch::Receiver<ConnectionState> {
         self.state_tx.subscribe()
+    }
+
+    /// Establish a WebSocket connection, optionally through a SOCKS5 proxy.
+    ///
+    /// When the `proxy` feature is enabled and `config.socks5_proxy` is `Some`,
+    /// the connection is tunneled through the specified SOCKS5 proxy. Otherwise,
+    /// a direct connection is established.
+    async fn connect(
+        endpoint: &str,
+        config: &Config,
+    ) -> std::result::Result<
+        (WsStream, tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>),
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        #[cfg(feature = "proxy")]
+        if let Some(proxy_addr) = &config.socks5_proxy {
+            return Self::connect_via_proxy(proxy_addr, endpoint).await;
+        }
+
+        let _ = config; // suppress unused warning when proxy feature is off
+        connect_async(endpoint).await
+    }
+
+    /// Connect to a WebSocket endpoint through a SOCKS5 proxy.
+    #[cfg(feature = "proxy")]
+    async fn connect_via_proxy(
+        proxy_addr: &str,
+        endpoint: &str,
+    ) -> std::result::Result<
+        (WsStream, tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>),
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        use tokio_tungstenite::tungstenite::Error as WsErr;
+
+        // Parse the WSS URL to extract host and port
+        let url: url::Url = endpoint
+            .parse()
+            .map_err(|_e| WsErr::Url(tokio_tungstenite::tungstenite::error::UrlError::NoHostName))?;
+        let host = url
+            .host_str()
+            .ok_or(WsErr::Url(tokio_tungstenite::tungstenite::error::UrlError::NoHostName))?;
+        let port = url.port_or_known_default().unwrap_or(443);
+
+        // Establish SOCKS5 tunnel
+        let socks_stream = tokio_socks::tcp::Socks5Stream::connect(proxy_addr, (host, port))
+            .await
+            .map_err(|e| WsErr::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)))?;
+        let tcp: TcpStream = socks_stream.into_inner();
+
+        // Establish WebSocket over the SOCKS tunnel.
+        // Passing `None` for the connector lets tokio-tungstenite use its default TLS
+        // stack (rustls via the `rustls-tls-native-roots` feature), which handles
+        // certificate validation and TLS negotiation automatically.
+        tokio_tungstenite::client_async_tls_with_config(endpoint, tcp, None, None).await
     }
 }

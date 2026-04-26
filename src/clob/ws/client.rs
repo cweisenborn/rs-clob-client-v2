@@ -643,6 +643,19 @@ impl ChannelResources {
     }
 }
 
+impl Drop for ChannelResources {
+    fn drop(&mut self) {
+        // Break the Arc cycle: without this, the reconnection handler task
+        // holds an `Arc<SubscriptionManager>` whose cloned `ConnectionManager`
+        // keeps `sender_tx` alive, so `connection_loop` never observes
+        // `sender_rx.is_closed()` and the TCP socket leaks. Cancelling the
+        // handler lets the last Arc drop, the inner `ConnectionManager` clone
+        // drops, the final `sender_tx` drops, `sender_rx` closes, and the
+        // connection loop exits cleanly.
+        self.subscriptions.shutdown();
+    }
+}
+
 fn normalize_base_endpoint(endpoint: &str) -> String {
     let trimmed = endpoint.trim_end_matches('/');
     if let Some(stripped) = trimmed.strip_suffix("/ws/market") {

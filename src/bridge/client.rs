@@ -69,6 +69,20 @@ impl Client {
         })
     }
 
+    /// Creates a new Bridge API client with a custom host and a pre-configured HTTP client.
+    ///
+    /// This enables proxy support, custom timeouts, or other `reqwest::ClientBuilder` options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host URL is invalid.
+    pub fn new_with_http_client(host: &str, http_client: ReqwestClient) -> Result<Client> {
+        Ok(Self {
+            host: Url::parse(host)?,
+            client: http_client,
+        })
+    }
+
     /// Returns the host URL for the client.
     #[must_use]
     pub fn host(&self) -> &Url {

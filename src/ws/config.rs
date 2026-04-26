@@ -23,6 +23,13 @@ pub struct Config {
     pub heartbeat_timeout: Duration,
     /// Reconnection strategy configuration
     pub reconnect: ReconnectConfig,
+    /// Optional SOCKS5 proxy address (`host:port`) for WebSocket connections.
+    ///
+    /// When set, WebSocket connections are tunneled through the specified SOCKS5 proxy.
+    /// This is useful for geo-restricted access or VPN routing.
+    ///
+    /// Requires the `proxy` feature to be enabled.
+    pub socks5_proxy: Option<String>,
 }
 
 impl Default for Config {
@@ -31,6 +38,7 @@ impl Default for Config {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL_DURATION,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT_DURATION,
             reconnect: ReconnectConfig::default(),
+            socks5_proxy: None,
         }
     }
 }

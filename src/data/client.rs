@@ -101,6 +101,20 @@ impl Client {
         })
     }
 
+    /// Creates a new Data API client with a custom host URL and a pre-configured HTTP client.
+    ///
+    /// This enables proxy support, custom timeouts, or other `reqwest::ClientBuilder` options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URL is invalid.
+    pub fn new_with_http_client(host: &str, http_client: ReqwestClient) -> Result<Client> {
+        Ok(Self {
+            host: Url::parse(host)?,
+            client: http_client,
+        })
+    }
+
     /// Returns the base URL of the API.
     #[must_use]
     pub fn host(&self) -> &Url {

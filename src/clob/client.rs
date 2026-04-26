@@ -383,6 +383,15 @@ pub struct Config {
     #[builder(default = Duration::from_secs(5))]
     /// How often the [`Client`] will automatically submit heartbeats. The default is five (5) seconds.
     heartbeat_interval: Duration,
+    /// Optional pre-configured [`reqwest::Client`] to use for HTTP requests.
+    ///
+    /// When provided, this client is used as-is (the SDK's default headers are still applied
+    /// via per-request overrides). This enables proxy support, custom timeouts, or other
+    /// `reqwest::ClientBuilder` options that the SDK doesn't expose directly.
+    ///
+    /// When `None` (the default), the SDK creates its own `reqwest::Client`.
+    #[builder(into)]
+    http_client: Option<ReqwestClient>,
 }
 
 impl Default for Config {
@@ -393,6 +402,7 @@ impl Default for Config {
             builder_code: None,
             #[cfg(feature = "heartbeats")]
             heartbeat_interval: Duration::from_secs(5),
+            http_client: None,
         }
     }
 }
@@ -1429,7 +1439,11 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        let client = if let Some(custom) = config.http_client.clone() {
+            custom
+        } else {
+            ReqwestClient::builder().default_headers(headers).build()?
+        };
 
         let geoblock_host = Url::parse(
             config

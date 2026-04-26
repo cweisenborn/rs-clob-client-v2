@@ -12,6 +12,7 @@ use async_stream::try_stream;
 use dashmap::{DashMap, Entry};
 use futures::Stream;
 use tokio::sync::broadcast::error::RecvError;
+use tokio_util::sync::CancellationToken;
 
 use super::interest::{InterestTracker, MessageInterest};
 use super::types::request::SubscriptionRequest;
@@ -84,6 +85,13 @@ pub struct SubscriptionManager {
     /// Track if custom features were enabled for any market subscription
     /// (enables `best_bid_ask`, `new_market`, `market_resolved` messages)
     custom_features_enabled: AtomicBool,
+    /// Signals the reconnection handler task to exit. Without this, the
+    /// handler holds an `Arc<SubscriptionManager>` whose inner cloned
+    /// `ConnectionManager` keeps `sender_tx` alive, preventing
+    /// `connection_loop` from ever seeing `sender_rx.is_closed()` — an
+    /// Arc cycle that leaks the whole task graph (TCP socket included)
+    /// every time the last subscription goes away.
+    shutdown: CancellationToken,
 }
 
 impl SubscriptionManager {
@@ -101,7 +109,14 @@ impl SubscriptionManager {
             subscribed_markets: DashMap::new(),
             last_auth: Arc::new(RwLock::new(None)),
             custom_features_enabled: AtomicBool::new(false),
+            shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Signal the reconnection handler to exit so this SubscriptionManager
+    /// can be dropped. Safe to call multiple times.
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     /// Start the reconnection handler that re-subscribes on connection recovery.
@@ -113,30 +128,36 @@ impl SubscriptionManager {
             let mut was_connected = state_rx.borrow().is_connected();
 
             loop {
-                // Wait for next state change
-                if state_rx.changed().await.is_err() {
-                    // Channel closed, connection manager is gone
-                    break;
-                }
-
-                let state = *state_rx.borrow_and_update();
-
-                match state {
-                    ConnectionState::Connected { .. } => {
-                        if was_connected {
-                            // Reconnect to subscriptions
-                            #[cfg(feature = "tracing")]
-                            tracing::debug!("WebSocket reconnected, re-establishing subscriptions");
-                            this.resubscribe_all();
-                        }
-                        was_connected = true;
-                    }
-                    ConnectionState::Disconnected => {
-                        // Connection permanently closed
+                tokio::select! {
+                    _ = this.shutdown.cancelled() => {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("Reconnection handler shutting down");
                         break;
                     }
-                    _ => {
-                        // Other states are no-op
+                    changed = state_rx.changed() => {
+                        if changed.is_err() {
+                            // Channel closed, connection manager is gone
+                            break;
+                        }
+                        let state = *state_rx.borrow_and_update();
+                        match state {
+                            ConnectionState::Connected { .. } => {
+                                if was_connected {
+                                    // Reconnect to subscriptions
+                                    #[cfg(feature = "tracing")]
+                                    tracing::debug!("WebSocket reconnected, re-establishing subscriptions");
+                                    this.resubscribe_all();
+                                }
+                                was_connected = true;
+                            }
+                            ConnectionState::Disconnected => {
+                                // Connection permanently closed
+                                break;
+                            }
+                            _ => {
+                                // Other states are no-op
+                            }
+                        }
                     }
                 }
             }
