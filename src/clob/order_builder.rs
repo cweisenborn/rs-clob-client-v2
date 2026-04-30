@@ -158,6 +158,15 @@ impl<OrderKind, K: AuthKind> OrderBuilder<OrderKind, K> {
     ) -> Result<OrderPayload> {
         let version = self.client.resolve_version(false).await?;
         let maker = self.funder.unwrap_or(self.signer);
+        let signer = if matches!(self.signature_type, SignatureType::Poly1271) {
+            self.funder.ok_or_else(|| {
+                Error::validation(
+                    "A deposit wallet funder address is required with a Poly1271 signature type",
+                )
+            })?
+        } else {
+            self.signer
+        };
 
         match version {
             1 => {
@@ -194,7 +203,7 @@ impl<OrderKind, K: AuthKind> OrderBuilder<OrderKind, K> {
                     OrderV2 {
                         salt: U256::from(salt),
                         maker,
-                        signer: self.signer,
+                        signer,
                         tokenId: token_id,
                         makerAmount: U256::from(maker_amount),
                         takerAmount: U256::from(taker_amount),
@@ -378,19 +387,17 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         let order = self.build().await?;
         let signed = client.sign(signer, order).await?;
         let result = client.post_order(signed).await;
-        if let Err(err) = &result {
-            if let Some(status) = err.downcast_ref::<crate::error::Status>() {
-                if status
-                    .message
-                    .contains(crate::clob::client::ORDER_VERSION_MISMATCH_ERROR)
-                {
-                    let after_version = client.resolve_version(false).await.unwrap_or(0);
-                    if after_version != before_version {
-                        let order = retry.build().await?;
-                        let signed = client.sign(signer, order).await?;
-                        return client.post_order(signed).await;
-                    }
-                }
+        if let Err(err) = &result
+            && let Some(status) = err.downcast_ref::<crate::error::Status>()
+            && status
+                .message
+                .contains(crate::clob::client::ORDER_VERSION_MISMATCH_ERROR)
+        {
+            let after_version = client.resolve_version(false).await.unwrap_or(0);
+            if after_version != before_version {
+                let order = retry.build().await?;
+                let signed = client.sign(signer, order).await?;
+                return client.post_order(signed).await;
             }
         }
         result
@@ -633,19 +640,17 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
         let order = self.build().await?;
         let signed = client.sign(signer, order).await?;
         let result = client.post_order(signed).await;
-        if let Err(err) = &result {
-            if let Some(status) = err.downcast_ref::<crate::error::Status>() {
-                if status
-                    .message
-                    .contains(crate::clob::client::ORDER_VERSION_MISMATCH_ERROR)
-                {
-                    let after_version = client.resolve_version(false).await.unwrap_or(0);
-                    if after_version != before_version {
-                        let order = retry.build().await?;
-                        let signed = client.sign(signer, order).await?;
-                        return client.post_order(signed).await;
-                    }
-                }
+        if let Err(err) = &result
+            && let Some(status) = err.downcast_ref::<crate::error::Status>()
+            && status
+                .message
+                .contains(crate::clob::client::ORDER_VERSION_MISMATCH_ERROR)
+        {
+            let after_version = client.resolve_version(false).await.unwrap_or(0);
+            if after_version != before_version {
+                let order = retry.build().await?;
+                let signed = client.sign(signer, order).await?;
+                return client.post_order(signed).await;
             }
         }
         result

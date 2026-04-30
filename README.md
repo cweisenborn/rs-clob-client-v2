@@ -228,6 +228,17 @@ The **signature_type** parameter tells the system how to verify your signatures:
 
 See [`SignatureType`](src/clob/types/mod.rs) for more information.
 
+For deposit wallets, pass the deployed deposit wallet as the funder and use `SignatureType::Poly1271`:
+
+```rust,ignore
+let client = Client::new("https://clob-v2.polymarket.com", Config::default())?
+    .authentication_builder(&signer)
+    .funder(deposit_wallet)
+    .signature_type(SignatureType::Poly1271)
+    .authenticate()
+    .await?;
+```
+
 ##### Place a market order
 
 ```rust,ignore

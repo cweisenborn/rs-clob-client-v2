@@ -649,11 +649,92 @@ pub struct SignableOrder {
 #[derive(Debug, Builder, PartialEq)]
 pub struct SignedOrder {
     pub payload: OrderPayload,
-    pub signature: Signature,
+    #[builder(into)]
+    pub signature: OrderSignature,
     pub order_type: OrderType,
     pub owner: ApiKey,
     pub post_only: Option<bool>,
     pub defer_exec: Option<bool>,
+}
+
+/// Signature material attached to a signed order.
+///
+/// Most orders carry a normal 65-byte ECDSA signature. Deposit wallet orders
+/// using [`SignatureType::Poly1271`] carry the longer wrapped signature that the
+/// deposit wallet validates through EIP-1271.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq)]
+pub enum OrderSignature {
+    Ecdsa(Signature),
+    Wrapped(String),
+}
+
+impl OrderSignature {
+    /// Returns the ECDSA `r` value for a normal order signature.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a wrapped deposit wallet signature.
+    #[must_use]
+    pub fn r(&self) -> U256 {
+        match self {
+            OrderSignature::Ecdsa(sig) => sig.r(),
+            OrderSignature::Wrapped(_) => {
+                panic!("wrapped deposit wallet signatures do not expose an ECDSA r value")
+            }
+        }
+    }
+
+    /// Returns the ECDSA `s` value for a normal order signature.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a wrapped deposit wallet signature.
+    #[must_use]
+    pub fn s(&self) -> U256 {
+        match self {
+            OrderSignature::Ecdsa(sig) => sig.s(),
+            OrderSignature::Wrapped(_) => {
+                panic!("wrapped deposit wallet signatures do not expose an ECDSA s value")
+            }
+        }
+    }
+}
+
+impl From<Signature> for OrderSignature {
+    fn from(signature: Signature) -> Self {
+        OrderSignature::Ecdsa(signature)
+    }
+}
+
+impl From<String> for OrderSignature {
+    fn from(signature: String) -> Self {
+        OrderSignature::Wrapped(signature)
+    }
+}
+
+impl From<&str> for OrderSignature {
+    fn from(signature: &str) -> Self {
+        OrderSignature::Wrapped(signature.to_owned())
+    }
+}
+
+impl fmt::Display for OrderSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OrderSignature::Ecdsa(sig) => write!(f, "{sig}"),
+            OrderSignature::Wrapped(sig) => f.write_str(sig),
+        }
+    }
+}
+
+impl PartialEq<Signature> for OrderSignature {
+    fn eq(&self, other: &Signature) -> bool {
+        match self {
+            OrderSignature::Ecdsa(sig) => sig == other,
+            OrderSignature::Wrapped(_) => false,
+        }
+    }
 }
 
 /// V2 `order` body with the signature folded in.
@@ -944,7 +1025,7 @@ mod tests {
     fn signed_order_serialization_omits_post_only_when_none() {
         let signed_order = SignedOrder {
             payload: OrderPayload::default(),
-            signature: Signature::new(U256::ZERO, U256::ZERO, false),
+            signature: Signature::new(U256::ZERO, U256::ZERO, false).into(),
             order_type: OrderType::GTC,
             owner: ApiKey::nil(),
             post_only: None,
@@ -964,7 +1045,7 @@ mod tests {
     fn signed_order_serialization_includes_fields() {
         let signed_order = SignedOrder {
             payload: OrderPayload::default(),
-            signature: Signature::new(U256::ZERO, U256::ZERO, false),
+            signature: Signature::new(U256::ZERO, U256::ZERO, false).into(),
             order_type: OrderType::GTC,
             owner: ApiKey::nil(),
             post_only: None,
@@ -986,5 +1067,26 @@ mod tests {
         assert!(!order_obj.contains_key("feeRateBps"));
         // deferExec should be present
         assert!(object.contains_key("deferExec"));
+    }
+
+    #[test]
+    fn signed_order_serialization_uses_wrapped_signature() {
+        let signed_order = SignedOrder {
+            payload: OrderPayload::default(),
+            signature: OrderSignature::Wrapped("0xwrapped".to_owned()),
+            order_type: OrderType::GTC,
+            owner: ApiKey::nil(),
+            post_only: None,
+            defer_exec: None,
+        };
+
+        let value = to_value(&signed_order).expect("serialize SignedOrder");
+        let order_obj = value
+            .as_object()
+            .and_then(|object| object.get("order"))
+            .and_then(serde_json::Value::as_object)
+            .expect("order object");
+
+        assert_eq!(order_obj["signature"], "0xwrapped");
     }
 }

@@ -217,6 +217,11 @@ path = "examples/clob/orders/gtc_limit_buy.rs"
 required-features = ["clob"]
 
 [[example]]
+name = "gtc_limit_buy_deposit_wallet"
+path = "examples/clob/orders/gtc_limit_buy_deposit_wallet.rs"
+required-features = ["clob"]
+
+[[example]]
 name = "gtc_limit_sell"
 path = "examples/clob/orders/gtc_limit_sell.rs"
 required-features = ["clob"]

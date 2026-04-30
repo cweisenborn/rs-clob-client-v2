@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::U256;
+use alloy::primitives::{Signature, U256, keccak256};
 use alloy::signers::Signer;
 use alloy::sol_types::SolStruct as _;
+use alloy::sol_types::SolValue as _;
 use async_stream::try_stream;
 use bon::Builder;
 use chrono::{NaiveDate, Utc};
@@ -54,7 +55,8 @@ use crate::clob::types::{
     RfqRequestsRequest,
 };
 use crate::clob::types::{
-    Amount, OrderPayload, OrderType, Side, SignableOrder, SignatureType, SignedOrder, TickSize,
+    Amount, OrderPayload, OrderSignature, OrderType, Side, SignableOrder, SignatureType,
+    SignedOrder, TickSize,
 };
 use crate::error::{Error, Kind as ErrorKind, Synchronization};
 use crate::types::{Address, B256, Decimal};
@@ -66,10 +68,41 @@ use crate::{
 const ORDER_NAME: Option<Cow<'static, str>> = Some(Cow::Borrowed("Polymarket CTF Exchange"));
 const VERSION_V1: Option<Cow<'static, str>> = Some(Cow::Borrowed("1"));
 const VERSION_V2: Option<Cow<'static, str>> = Some(Cow::Borrowed("2"));
+const DEPOSIT_WALLET_NAME: &str = "DepositWallet";
+const DEPOSIT_WALLET_VERSION: &str = "1";
+const ORDER_TYPE_STRING: &str = concat!(
+    "Order(uint256 salt,address maker,address signer,uint256 tokenId,",
+    "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,",
+    "uint256 timestamp,bytes32 metadata,bytes32 builder)"
+);
+const SOLADY_TYPE_STRING: &str = concat!(
+    "TypedDataSign(Order contents,string name,string version,uint256 chainId,",
+    "address verifyingContract,bytes32 salt)",
+    "Order(uint256 salt,address maker,address signer,uint256 tokenId,",
+    "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,",
+    "uint256 timestamp,bytes32 metadata,bytes32 builder)"
+);
 
 const TERMINAL_CURSOR: &str = "LTE="; // base64("-1")
 
 pub(crate) const ORDER_VERSION_MISMATCH_ERROR: &str = "order_version_mismatch";
+
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(bytes.len() * 2);
+    for byte in bytes {
+        out.push(LUT[(byte >> 4) as usize] as char);
+        out.push(LUT[(byte & 0x0f) as usize] as char);
+    }
+}
+
+fn signature_hex_no_prefix(signature: &Signature) -> String {
+    let signature = signature.to_string();
+    signature
+        .strip_prefix("0x")
+        .unwrap_or(&signature)
+        .to_owned()
+}
 
 /// The type used to build a request to authenticate the inner [`Client<Unauthorized>`]. Calling
 /// `authenticate` on this will elevate that inner `client` into an [`Client<Authenticated<K>>`].
@@ -87,8 +120,8 @@ pub struct AuthenticationBuilder<'signer, S: Signer, K: Kind = Normal> {
     /// headers for different types of authentication, e.g. Builder.
     kind: K,
     /// The optional [`Address`] used to represent the funder for this `client`. If a funder is set
-    /// then `signature_type` must match `Some(SignatureType::Proxy | Signature::GnosisSafe)`. Conversely,
-    /// if funder is not set, then `signature_type` must be `Some(SignatureType::Eoa)`.
+    /// then `signature_type` must match `Some(SignatureType::Proxy | SignatureType::GnosisSafe | SignatureType::Poly1271)`.
+    /// Conversely, if funder is not set, then `signature_type` must be `Some(SignatureType::Eoa)`.
     funder: Option<Address>,
     /// The optional [`SignatureType`], see `funder` for more information.
     signature_type: Option<SignatureType>,
@@ -179,9 +212,18 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
                     "Cannot have a funder address with a {sig} signature type"
                 )));
             }
+            (None, Some(SignatureType::Poly1271)) => {
+                return Err(Error::validation(
+                    "A deposit wallet funder address is required with a Poly1271 signature type",
+                ));
+            }
             (
                 Some(Address::ZERO),
-                Some(sig @ (SignatureType::Proxy | SignatureType::GnosisSafe)),
+                Some(
+                    sig @ (SignatureType::Proxy
+                    | SignatureType::GnosisSafe
+                    | SignatureType::Poly1271),
+                ),
             ) => {
                 return Err(Error::validation(format!(
                     "Cannot have a zero funder address with a {sig} signature type"
@@ -1013,8 +1055,8 @@ impl<S: State> Client<S> {
         Ok(response)
     }
 
-    /// Resolves the V1 `feeRateBps` to apply to an order. Mirrors the TS client's
-    /// `_resolveFeeRateBps`: fetches the market rate via [`Self::fee_rate_bps`] and,
+    /// Resolves the V1 `feeRateBps` to apply to an order: fetches the market rate via
+    /// [`Self::fee_rate_bps`] and,
     /// when the caller supplied an override, validates that it matches.
     ///
     /// # Errors
@@ -1818,9 +1860,15 @@ impl<K: Kind> Client<Authenticated<K>> {
                     verifying_contract: Some(exchange),
                     ..Eip712Domain::default()
                 };
-                signer
-                    .sign_hash(&p.order.eip712_signing_hash(&domain))
-                    .await?
+                if p.order.signatureType == SignatureType::Poly1271 as u8 {
+                    self.sign_poly1271_order(signer, &p.order, &domain, chain_id)
+                        .await?
+                } else {
+                    signer
+                        .sign_hash(&p.order.eip712_signing_hash(&domain))
+                        .await?
+                        .into()
+                }
             }
             OrderPayload::V1(p) => {
                 let domain = Eip712Domain {
@@ -1833,6 +1881,7 @@ impl<K: Kind> Client<Authenticated<K>> {
                 signer
                     .sign_hash(&p.order.eip712_signing_hash(&domain))
                     .await?
+                    .into()
             }
         };
 
@@ -1844,6 +1893,51 @@ impl<K: Kind> Client<Authenticated<K>> {
             post_only,
             defer_exec,
         })
+    }
+
+    async fn sign_poly1271_order<S: Signer>(
+        &self,
+        signer: &S,
+        order: &crate::clob::types::OrderV2,
+        app_domain: &Eip712Domain,
+        chain_id: u64,
+    ) -> Result<OrderSignature> {
+        let contents_hash = order.eip712_hash_struct();
+        let app_domain_separator = app_domain.hash_struct();
+
+        let typed_data_sign_struct_hash = keccak256(
+            (
+                keccak256(SOLADY_TYPE_STRING.as_bytes()),
+                contents_hash,
+                keccak256(DEPOSIT_WALLET_NAME.as_bytes()),
+                keccak256(DEPOSIT_WALLET_VERSION.as_bytes()),
+                U256::from(chain_id),
+                order.signer,
+                B256::ZERO,
+            )
+                .abi_encode(),
+        );
+
+        let mut digest_input = [0_u8; 66];
+        digest_input[0] = 0x19;
+        digest_input[1] = 0x01;
+        digest_input[2..34].copy_from_slice(app_domain_separator.as_slice());
+        digest_input[34..66].copy_from_slice(typed_data_sign_struct_hash.as_slice());
+        let digest = keccak256(digest_input);
+
+        let inner_signature = signer.sign_hash(&digest).await?;
+        let mut wrapped =
+            String::with_capacity(2 + 130 + 64 + 64 + (ORDER_TYPE_STRING.len() * 2) + 4);
+        wrapped.push_str("0x");
+        wrapped.push_str(&signature_hex_no_prefix(&inner_signature));
+        push_hex(&mut wrapped, app_domain_separator.as_slice());
+        push_hex(&mut wrapped, contents_hash.as_slice());
+        push_hex(&mut wrapped, ORDER_TYPE_STRING.as_bytes());
+        let contents_type_len =
+            u16::try_from(ORDER_TYPE_STRING.len()).expect("order type string length fits in u16");
+        push_hex(&mut wrapped, &contents_type_len.to_be_bytes());
+
+        Ok(OrderSignature::Wrapped(wrapped))
     }
 
     /// Posts a signed order to the orderbook.

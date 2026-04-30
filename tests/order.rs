@@ -339,6 +339,33 @@ mod lifecycle {
             "Cannot have a zero funder address with a GnosisSafe signature type"
         );
 
+        let err = Client::new(&server.base_url(), Config::default())?
+            .authentication_builder(&signer)
+            .signature_type(SignatureType::Poly1271)
+            .authenticate()
+            .await
+            .unwrap_err();
+        let msg = &err.downcast_ref::<Validation>().unwrap().reason;
+
+        assert_eq!(
+            msg,
+            "A deposit wallet funder address is required with a Poly1271 signature type"
+        );
+
+        let err = Client::new(&server.base_url(), Config::default())?
+            .authentication_builder(&signer)
+            .funder(Address::ZERO)
+            .signature_type(SignatureType::Poly1271)
+            .authenticate()
+            .await
+            .unwrap_err();
+        let msg = &err.downcast_ref::<Validation>().unwrap().reason;
+
+        assert_eq!(
+            msg,
+            "Cannot have a zero funder address with a Poly1271 signature type"
+        );
+
         Ok(())
     }
 
@@ -3428,6 +3455,8 @@ mod v2 {
                 .await?;
 
             let order = &signable.v2().order;
+            assert_eq!(order.maker, funder);
+            assert_eq!(order.signer, funder);
             assert_eq!(order.signatureType, SignatureType::Poly1271 as u8);
 
             Ok(())
@@ -3860,12 +3889,27 @@ mod v2 {
     mod signing {
         use alloy::signers::Signer as _;
         use alloy::signers::local::LocalSigner;
-        use polymarket_client_sdk_v2::POLYGON;
+        use polymarket_client_sdk_v2::auth::Credentials;
+        use polymarket_client_sdk_v2::clob::types::{OrderPayload, OrderV2, SignableOrder};
         use polymarket_client_sdk_v2::clob::{Client, Config};
+        use polymarket_client_sdk_v2::{AMOY, POLYGON};
         use serde_json::json;
 
         use super::*;
         use crate::common::{API_KEY, PASSPHRASE, POLY_ADDRESS, PRIVATE_KEY, SECRET};
+
+        const EXPECTED_POLY_1271_SIGNATURE: &str = concat!(
+            "0xa3a093c83b6c20c83355c16ce94c92e6e9fcbdeb840618cc74f6c57a42ad145b",
+            "2b98db73d2c73cbf1f2b6af288566ae81960ddbc3a13921027358a8bff3be6ff1c",
+            "a440cbd865bc0c6243d7a8df9a8bf48a8827b0a4abbb61c30e96d305423af148",
+            "d23d42d3ad94e65d78258cecaf8dcbaddac0f73dc085040f2c12bb595dd83804",
+            "4f726465722875696e743235362073616c742c61646472657373206d616b65722c",
+            "61646472657373207369676e65722c75696e7432353620746f6b656e49642c75",
+            "696e74323536206d616b6572416d6f756e742c75696e743235362074616b6572",
+            "416d6f756e742c75696e743820736964652c75696e7438207369676e61747572",
+            "65547970652c75696e743235362074696d657374616d702c6279746573333220",
+            "6d657461646174612c62797465733332206275696c6465722900ba"
+        );
 
         #[tokio::test]
         async fn v2_sign_produces_valid_signature() -> anyhow::Result<()> {
@@ -3915,6 +3959,59 @@ mod v2 {
 
             // Verify owner is set
             assert_eq!(signed.owner, API_KEY);
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn v2_poly1271_signing_matches_deposit_wallet_signature() -> anyhow::Result<()> {
+            let server = MockServer::start();
+            let signer = LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(AMOY));
+            let deposit_wallet = address!("0x1111111111111111111111111111111111111111");
+
+            let client = Client::new(&server.base_url(), Config::default())?
+                .authentication_builder(&signer)
+                .credentials(Credentials::new(
+                    API_KEY,
+                    SECRET.to_owned(),
+                    PASSPHRASE.to_owned(),
+                ))
+                .funder(deposit_wallet)
+                .signature_type(SignatureType::Poly1271)
+                .authenticate()
+                .await?;
+
+            server.mock(|when, then| {
+                when.method(httpmock::Method::GET).path("/neg-risk");
+                then.status(StatusCode::OK)
+                    .json_body(json!({ "neg_risk": false }));
+            });
+
+            let mut order = OrderV2::default();
+            order.salt = U256::from(479_249_096_354_u64);
+            order.maker = deposit_wallet;
+            order.signer = deposit_wallet;
+            order.tokenId = U256::from(1234_u64);
+            order.makerAmount = U256::from(100_000_000_u64);
+            order.takerAmount = U256::from(50_000_000_u64);
+            order.side = Side::Buy as u8;
+            order.signatureType = SignatureType::Poly1271 as u8;
+            order.timestamp = U256::from(1_710_000_000_000_u64);
+            order.metadata = B256::ZERO;
+            order.builder = B256::ZERO;
+
+            let signable = SignableOrder::builder()
+                .payload(OrderPayload::new(order, U256::ZERO))
+                .order_type(OrderType::GTC)
+                .build();
+
+            let signed = client.sign(&signer, signable).await?;
+
+            assert_eq!(signed.signature.to_string(), EXPECTED_POLY_1271_SIGNATURE);
+            assert_eq!(
+                signed.signature.to_string().len(),
+                2 + 130 + 64 + 64 + (186 * 2) + 4
+            );
 
             Ok(())
         }
