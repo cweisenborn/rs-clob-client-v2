@@ -392,6 +392,14 @@ pub struct Config {
     /// When `None` (the default), the SDK creates its own `reqwest::Client`.
     #[builder(into)]
     http_client: Option<ReqwestClient>,
+    /// Proxy URL applied to the Cloudflare-bypass `POST /auth/api-key` path only.
+    ///
+    /// Has no effect on any other endpoint (those continue to use [`Self::http_client`]).
+    /// Accepts any URL `wreq::Proxy::all` accepts, e.g. `socks5h://localhost:11080`.
+    /// Only available when the `cf-bypass` feature is enabled.
+    #[cfg(feature = "cf-bypass")]
+    #[builder(into)]
+    cf_bypass_proxy: Option<String>,
 }
 
 impl Default for Config {
@@ -403,6 +411,8 @@ impl Default for Config {
             #[cfg(feature = "heartbeats")]
             heartbeat_interval: Duration::from_secs(5),
             http_client: None,
+            #[cfg(feature = "cf-bypass")]
+            cf_bypass_proxy: None,
         }
     }
 }
@@ -457,18 +467,98 @@ impl<S: State> ClientInner<S> {
 }
 
 impl ClientInner<Unauthenticated> {
+    /// Registers fresh API credentials for the wallet behind `signer`.
+    ///
+    /// # Cloudflare WAF note
+    ///
+    /// Polymarket's edge fronts this endpoint with a Cloudflare bot-management rule
+    /// that returns HTTP 403 for `POST /auth/api-key` from clients whose TLS/HTTP2
+    /// fingerprint matches stock reqwest or Chrome — i.e., from this SDK's default
+    /// HTTP client. `GET /auth/derive-api-key` is unaffected. There is no documented
+    /// backend bootstrap path; the Polymarket UI only registers Safe / Magic-link
+    /// proxy wallets, so EOAs that need fresh creds have to either come from a
+    /// residential IP or speak a non-Chrome TLS fingerprint.
+    ///
+    /// Enable the `cf-bypass` feature to route this single call through `wreq` with
+    /// a Firefox emulation profile (Polymarket's WAF lets Firefox/Safari fingerprints
+    /// through). Set [`Config::cf_bypass_proxy`] if you need the call to egress via
+    /// a SOCKS5/HTTP proxy. The rest of the SDK keeps using the regular reqwest
+    /// client; no other endpoint trips this rule.
+    ///
+    /// See <https://github.com/Polymarket/py-clob-client-v2/issues/38> and
+    /// <https://github.com/Polymarket/py-clob-client/issues/91> for upstream context.
     pub async fn create_api_key<S: Signer>(
         &self,
         signer: &S,
         nonce: Option<u32>,
     ) -> Result<Credentials> {
-        let request = self
-            .client
-            .request(Method::POST, format!("{}auth/api-key", self.host))
-            .build()?;
-        let headers = self.create_headers(signer, nonce).await?;
+        #[cfg(feature = "cf-bypass")]
+        {
+            return self.create_api_key_cf_bypass(signer, nonce).await;
+        }
 
-        crate::request(&self.client, request, Some(headers)).await
+        #[cfg(not(feature = "cf-bypass"))]
+        {
+            let request = self
+                .client
+                .request(Method::POST, format!("{}auth/api-key", self.host))
+                .build()?;
+            let headers = self.create_headers(signer, nonce).await?;
+
+            crate::request(&self.client, request, Some(headers)).await
+        }
+    }
+
+    /// Browser-fingerprint variant of [`Self::create_api_key`] used when the
+    /// `cf-bypass` feature is enabled. Sends `POST /auth/api-key` through a
+    /// `wreq::Client` with [`wreq_util::Emulation::Firefox136`], routed through
+    /// [`Config::cf_bypass_proxy`] if set. Scope is intentionally limited to this
+    /// one call — `derive_api_key` and the rest of the SDK keep using reqwest.
+    #[cfg(feature = "cf-bypass")]
+    async fn create_api_key_cf_bypass<S: Signer>(
+        &self,
+        signer: &S,
+        nonce: Option<u32>,
+    ) -> Result<Credentials> {
+        let url = format!("{}auth/api-key", self.host);
+        let auth_headers = self.create_headers(signer, nonce).await?;
+
+        let mut builder = wreq::Client::builder().emulation(wreq_util::Emulation::Firefox136);
+        if let Some(proxy_url) = self.config.cf_bypass_proxy.as_deref() {
+            let proxy = wreq::Proxy::all(proxy_url).map_err(|e| {
+                Error::validation(format!("invalid cf_bypass_proxy {proxy_url:?}: {e}"))
+            })?;
+            builder = builder.proxy(proxy);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| Error::with_source(ErrorKind::Internal, e))?;
+
+        let mut req = client.post(&url);
+        for (name, value) in auth_headers.iter() {
+            req = req.header(name, value);
+        }
+
+        let response = req
+            .send()
+            .await
+            .map_err(|e| Error::with_source(ErrorKind::Internal, e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::status(
+                status,
+                Method::POST,
+                "/auth/api-key".to_string(),
+                body,
+            ));
+        }
+
+        response
+            .json::<Credentials>()
+            .await
+            .map_err(|e| Error::with_source(ErrorKind::Internal, e))
     }
 
     pub async fn derive_api_key<S: Signer>(

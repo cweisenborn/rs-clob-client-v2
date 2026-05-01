@@ -35,6 +35,13 @@ ws = ["dep:backoff", "dep:bitflags", "dep:tokio", "dep:tokio-tungstenite", "dep:
 rtds = ["dep:backoff", "dep:tokio", "dep:tokio-tungstenite"]
 heartbeats = ["dep:tokio", "dep:tokio-util"]
 proxy = ["reqwest/socks", "dep:tokio-socks"]
+# Routes the WAF-sensitive `POST /auth/api-key` call through a browser-fingerprint
+# HTTP client (Firefox emulation via `wreq` + `wreq-util`) so it bypasses
+# Cloudflare's bot-management rule that blocks Chrome-shaped / stock-reqwest TLS
+# fingerprints from POSTing to that path. See `ClientInner::create_api_key` and
+# https://github.com/Polymarket/py-clob-client-v2/issues/38 for context.
+# Adds a boringssl + libclang build-time dependency, hence opt-in.
+cf-bypass = ["dep:wreq", "dep:wreq-util"]
 
 [dependencies]
 alloy = { version = "1.6.3", default-features = false, features = [
@@ -79,6 +86,8 @@ tokio-util = { version = "0.7.18", optional = true }
 tracing = { version = "0.1", optional = true }
 url = "2.5.8"
 uuid = { version = "1.23.0", features = ["serde", "v4", "v7"] }
+wreq = { version = "6.0.0-rc.28", default-features = false, features = ["json", "socks"], optional = true }
+wreq-util = { version = "3.0.0-rc.10", features = ["emulation"], optional = true }
 
 [dev-dependencies]
 alloy = { version = "1.6.3", default-features = false, features = [
