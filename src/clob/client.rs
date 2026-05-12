@@ -2734,20 +2734,39 @@ impl<K: Kind> Client<Authenticated<K>> {
                         break
                     },
                     _ = ticker.tick() => {
-                        match client_clone.post_heartbeat(heartbeat_id).await {
+                        // Polymarket's /v1/heartbeats uses a rolling-token
+                        // protocol: the server holds a "currently-expected
+                        // heartbeat_id" per session. Wrong id → 400 with the
+                        // expected id in the body. Correct echo → 200 with a
+                        // fresh id and the server rotates. The expected id
+                        // also rotates whenever another authenticated request
+                        // (orders, balance refresh, …) hits the session, so
+                        // by the time the next 5 s tick fires the body we
+                        // picked up may already be stale. We handle it by
+                        // echoing back inline before this tick returns.
+                        let outcome = client_clone.post_heartbeat(heartbeat_id).await;
+                        let outcome = match outcome {
+                            Ok(r) => Ok(r),
+                            Err(e) => {
+                                let recovery_id = e
+                                    .downcast_ref::<crate::error::Status>()
+                                    .and_then(|s| parse_heartbeat_id_from_body(&s.message));
+                                match recovery_id {
+                                    Some(id) => client_clone.post_heartbeat(Some(id)).await,
+                                    None => Err(e),
+                                }
+                            }
+                        };
+                        match outcome {
                             Ok(response) => {
                                 #[cfg(feature = "tracing")]
                                 debug!("Heartbeat successfully sent: {response:?}");
                                 heartbeat_id = Some(response.heartbeat_id);
-                            },
+                            }
                             Err(e) => {
-                                // Polymarket's /v1/heartbeats uses a rolling-token
-                                // protocol: any ID that doesn't match the server's
-                                // current expected value returns 400 with the
-                                // expected value in the body. Echoing it on the
-                                // next tick is how the loop resyncs — required
-                                // both on cold start (first tick sends None) and
-                                // after a transient mismatch mid-session.
+                                // Last-ditch: persist whatever id we did
+                                // recover so the next tick has a shot at
+                                // resyncing without another cold-start 400.
                                 if let Some(status) = e.downcast_ref::<crate::error::Status>() {
                                     if let Some(id) = parse_heartbeat_id_from_body(&status.message) {
                                         heartbeat_id = Some(id);
