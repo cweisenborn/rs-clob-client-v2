@@ -2741,6 +2741,18 @@ impl<K: Kind> Client<Authenticated<K>> {
                                 heartbeat_id = Some(response.heartbeat_id);
                             },
                             Err(e) => {
+                                // Polymarket's /v1/heartbeats uses a rolling-token
+                                // protocol: any ID that doesn't match the server's
+                                // current expected value returns 400 with the
+                                // expected value in the body. Echoing it on the
+                                // next tick is how the loop resyncs — required
+                                // both on cold start (first tick sends None) and
+                                // after a transient mismatch mid-session.
+                                if let Some(status) = e.downcast_ref::<crate::error::Status>() {
+                                    if let Some(id) = parse_heartbeat_id_from_body(&status.message) {
+                                        heartbeat_id = Some(id);
+                                    }
+                                }
                                 #[cfg(feature = "tracing")]
                                 error!("Unable to post heartbeat: {e:?}");
                                 #[cfg(not(feature = "tracing"))]
@@ -3019,6 +3031,18 @@ impl<K: Kind> Client<Authenticated<K>> {
     }
 }
 
+/// Pull the `heartbeat_id` UUID out of a `/v1/heartbeats` error body.
+///
+/// The CLOB returns a body shaped `{"heartbeat_id":"<uuid>","error_msg":"..."}`
+/// on 400 — the UUID is the server's currently-expected token. Echoing it
+/// on the next request is what resyncs the rolling-token protocol. Returns
+/// `None` if the body doesn't contain a parseable `heartbeat_id`.
+#[cfg(feature = "heartbeats")]
+fn parse_heartbeat_id_from_body(body: &str) -> Option<Uuid> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("heartbeat_id")?.as_str()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3026,5 +3050,21 @@ mod tests {
     #[test]
     fn client_default_should_succeed() {
         _ = Client::default();
+    }
+
+    #[cfg(feature = "heartbeats")]
+    #[test]
+    fn parse_heartbeat_id_recovers_from_400_body() {
+        let body = r#"{"heartbeat_id":"b9065f31-8f22-42e2-980c-90327d6f7bfc","error_msg":"Invalid Heartbeat ID"}"#;
+        let id = parse_heartbeat_id_from_body(body).expect("should parse UUID from error body");
+        assert_eq!(id.to_string(), "b9065f31-8f22-42e2-980c-90327d6f7bfc");
+    }
+
+    #[cfg(feature = "heartbeats")]
+    #[test]
+    fn parse_heartbeat_id_returns_none_on_garbage() {
+        assert!(parse_heartbeat_id_from_body("not json").is_none());
+        assert!(parse_heartbeat_id_from_body(r#"{"other":"field"}"#).is_none());
+        assert!(parse_heartbeat_id_from_body(r#"{"heartbeat_id":"not-a-uuid"}"#).is_none());
     }
 }
